@@ -33,7 +33,7 @@ Boundary
 - Recreate boundary files whenever the mesh changes.
 
 Synthetic example
-- The examples folder contains artificial data; no real survey data are included.
+- The files directly under examples are artificial data for a small synthetic test.
 - In MATLAB, open examples and run run_example to create example.slf.
 - Then run telemac_boundary and select example.slf to define boundary conditions.
 
@@ -42,3 +42,10 @@ Status
 - The boundary editor supports 2D triangular SLF geometry.
 - AutoCAD outline export supports closed planar 2D polylines.
 - Verify coordinate systems, vertical datum, mesh quality and boundary settings for each application.
+
+Provided case datasets
+- examples/sea_of_marmara.zip: Sea of Marmara outline, bathymetry and islands.
+- examples/gulf_of_saros.zip: Gulf of Saros outline, bathymetry and islands.
+- examples/black_sea.zip: Black Sea outline, bathymetry and islands.
+- Extract a case ZIP inside examples; select its outline, bathymetry and island files in telemac_preprocess.
+- Each extracted case folder includes a short README mapping the input files.
