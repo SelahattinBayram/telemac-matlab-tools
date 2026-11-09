@@ -32,11 +32,6 @@ Boundary
 - Click Save CLI + BC2. Both files are saved; named CLI rows end with # segment_name.
 - Recreate boundary files whenever the mesh changes.
 
-Synthetic example
-- The files directly under examples are artificial data for a small synthetic test.
-- In MATLAB, open examples and run run_example to create example.slf.
-- Then run telemac_boundary and select example.slf to define boundary conditions.
-
 Status
 - Early version; tested with MATLAB R2024b and Gmsh 4.13.1 on macOS.
 - The boundary editor supports 2D triangular SLF geometry.
