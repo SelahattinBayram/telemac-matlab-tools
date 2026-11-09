@@ -1,0 +1,18 @@
+# Generated geometry, boundary and drawing files
+*.slf
+*.cli
+*.bc2
+*.dxf
+*.dwg
+*.dwl
+*.dwl2
+*.msh
+*.asv
+# MATLAB and operating system files
+*.mlx.autosave
+matlab.mat
+.DS_Store
+Thumbs.db
+# Local field data and outputs
+inputs/
+outputs/
