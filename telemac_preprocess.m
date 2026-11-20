@@ -6,6 +6,9 @@ function result = telemac_preprocess(cfg)
 % Interactive mode selects rectangles, circles or polygons for refinement.
 % RefinementRegions: struct array with Bounds=[xmin xmax ymin ymax],
 % TargetSize (metres), Transition (metres outside the shape).
+% BoundarySpacing and InteriorSpacing are approximate outer-outline/interior
+% edge targets, not hard minimum/maximum limits on generated mesh edges.
+% Either target can be larger; GrowthRatio controls a smooth transition.
 % Optional Shape: rectangle (default), circle (Center/Radius), polygon (Vertices).
 
 interactive = nargin == 0;
@@ -13,7 +16,7 @@ if interactive, cfg = struct; end
 base = fileparts(mfilename('fullpath'));
 defaults = struct('OutlineFile','','BathymetryFile','', ...
     'OutputFile',fullfile(base,'geometry.slf'),'BoundarySpacing',200, ...
-    'InteriorSpacing',100,'GrowthRatio',1.2,'GeometryTolerance',0.5, ...
+    'InteriorSpacing',500,'GrowthRatio',1.2,'GeometryTolerance',0.5, ...
     'GridStep',5,'SmoothIterations',10,'ZScale',1,'ZOffset',0, ...
     'MissingPolicy','error','GmshPath','','ShowFigure',true,'Overwrite',false, ...
     'IslandFile','','IslandSpacing',100,'RefinementRegions',[]);
@@ -202,15 +205,15 @@ if strcmp(choice,'Select file')
     end
 end
 while true
-a=inputdlg({'Outer boundary target point spacing [m]', ...
-    'Interior target edge length [m]', ...
-    'Size growth coefficient (>1; differs from Blue Kenue)', ...
+a=inputdlg({'Outer outline target edge length [m] (approximate)', ...
+    'Interior target edge length [m] (approximate)', ...
+    'Transition coefficient (>1; smaller = gentler)', ...
     'Boundary geometry tolerance [m] (smaller = more detail)', ...
     'Bathymetry intermediate grid spacing [m] (0 = direct)', ...
     'Smoothing iterations', ...
     'Z multiplier (elevation: 1; positive depth: -1)', ...
     'Z offset [m]'},'TELEMAC SLF settings',[1 76], ...
-    {'200','100','1.2','0.5','5','10','1','0'});
+    {'200','500','1.2','0.5','5','10','1','0'});
 assert(~isempty(a),'Cancelled.'); v=cellfun(@str2double,a);
 c.BoundarySpacing=v(1); c.InteriorSpacing=v(2); c.GrowthRatio=v(3);
 c.GeometryTolerance=v(4); c.GridStep=v(5); c.SmoothIterations=v(6);
@@ -657,7 +660,7 @@ end
 function q=subdivideBoundary(p,h)
 q=cell(size(p,1)-1,1);
 for i=1:numel(q)
-    count=max(1,ceil(norm(p(i+1,:)-p(i,:))/h));
+    count=max(1,round(norm(p(i+1,:)-p(i,:))/h));
     q{i}=p(i,:)+(0:count-1)'/count*(p(i+1,:)-p(i,:));
 end
 q=vertcat(q{:}); q=[q;q(1,:)];
@@ -692,8 +695,8 @@ guard=onCleanup(@() fclose(fid));
 origin=floor(min(p)); p=p-origin; n=size(p,1)-1;
 lengths=vecnorm(diff(p),2,2);
 % Short retained coastal segments and narrow channels need local refinement.
-% Keep point sizes on coastal details; the background fields control the
-% transition into the interior independently of boundary interpolation.
+% Retain geometry vertices for coastal details. The background fields alone
+% control sizing, so short segments do not propagate point-size refinement.
 localSize=min(c.BoundarySpacing,min(lengths,circshift(lengths,1)));
 fprintf(fid,'// XY origin: %.17g %.17g\n',origin);
 for i=1:n
@@ -724,14 +727,21 @@ end
 fprintf(fid,'Plane Surface(1) = {1:%d};\n',1+numel(islands));
 fprintf(fid,'Physical Curve(1) = {1:%d};\nPhysical Surface(2) = {1};\n',lastCurve);
 fprintf(fid,'Field[1] = Distance;\nField[1].CurvesList = {1:%d};\nField[1].Sampling = 30;\n',n);
-fprintf(fid,'Field[2] = MathEval;\n');
-if c.InteriorSpacing>=c.BoundarySpacing
-    fprintf(fid,'Field[2].F = "Min(%.17g, %.17g + %.17g*F1)";\n', ...
-        c.InteriorSpacing,c.BoundarySpacing,c.GrowthRatio-1);
+% Smoothly approach the requested interior target; do not leave it
+% unreachable merely because the domain is narrower than the growth band.
+delta=c.InteriorSpacing-c.BoundarySpacing;
+if delta==0
+    backgroundExpression=sprintf('%.17g',c.BoundarySpacing);
 else
-    fprintf(fid,'Field[2].F = "Max(%.17g, %.17g - %.17g*F1)";\n', ...
-        c.InteriorSpacing,c.BoundarySpacing,c.GrowthRatio-1);
+    reach=estimateInteriorReach(p,islands,origin);
+    width=min(1.5*abs(delta)/(c.GrowthRatio-1),reach);
+    width=max(width,1e-6);
+    blend=sprintf('Min(1,F1/%.17g)',width);
+    backgroundExpression=sprintf('%.17g%+.17g*(3*(%s)^2-2*(%s)^3)', ...
+        c.BoundarySpacing,delta,blend,blend);
+    fprintf('   Outer/interior transition: %.1f m; sampled interior reach %.1f m.\n',width,reach);
 end
+writeMathField(fid,2,backgroundExpression);
 sizeFields=2;
 if ~isempty(islands) && c.IslandSpacing>0
     fprintf(fid,'Field[5] = Distance;\nField[5].CurvesList = {%d:%d};\nField[5].Sampling = 30;\n',n+1,lastCurve);
@@ -748,17 +758,21 @@ for k=1:numel(c.RefinementRegions)
     blend=sprintf('Min(1,(%s)/%.17g)',distance,r.Transition);
     % Inline the blend: repeated nested MathEval field references can stall
     % older Gmsh releases during curve integration.
-    expression=sprintf('%.17g+%.17g*(3*(%s)^2-2*(%s)^3)', ...
-        r.TargetSize,max(c.InteriorSpacing,c.BoundarySpacing)-r.TargetSize,blend,blend);
+    weight=sprintf('(3*(%s)^2-2*(%s)^3)',blend,blend);
+    % Rejoin the local background, not the larger of the two global targets.
+    % Inline expressions avoid nested MathEval-field evaluation overhead.
+    expression=sprintf('(1-%s)*%.17g+%s*(%s)', ...
+        weight,r.TargetSize,weight,backgroundExpression);
     writeMathField(fid,id,expression);
     sizeFields(end+1)=id;
 end
 fprintf(fid,'Field[4] = Min;\nField[4].FieldsList = {%s};\nBackground Field = 4;\n', ...
     strjoin(string(sizeFields),','));
-% Distance fields already define the transition from all boundaries.
+% Target fields define the outer-outline/interior transition.
+% No hard MeshSizeMin/Max is imposed: actual edges can exceed either target.
 % Extending boundary sizes here would cap a coarser interior target.
 extendBoundary=0;
-fprintf(fid,['Mesh.MeshSizeFromPoints = 1;\n' ...
+fprintf(fid,['Mesh.MeshSizeFromPoints = 0;\n' ...
     'Mesh.MeshSizeFromCurvature = 0;\nMesh.MeshSizeExtendFromBoundary = %d;\n' ...
     'Mesh.Algorithm = 6;\nMesh.Smoothing = %d;\nMesh.ElementOrder = 1;\n' ...
     'Mesh.RecombineAll = 0;\nMesh.MshFileVersion = 2.2;\nMesh.Binary = 0;\n'],extendBoundary,c.SmoothIterations);
@@ -965,4 +979,24 @@ if ispc
 else
     q=['''' strrep(s,'''','''"''"''') ''''];
 end
+end
+
+function reach=estimateInteriorReach(p,islands,origin)
+% Estimate the largest outer-outline distance in water using a modest grid.
+% Coordinates p are local; island rings are supplied in absolute coordinates.
+lo=min(p);hi=max(p);
+[X,Y]=meshgrid(linspace(lo(1),hi(1),65),linspace(lo(2),hi(2),65));
+q=[X(:),Y(:)];inside=inpolygon(q(:,1),q(:,2),p(:,1),p(:,2));
+for k=1:numel(islands)
+    r=islands{k}-origin;
+    inside=inside & ~inpolygon(q(:,1),q(:,2),r(:,1),r(:,2));
+end
+q=q(inside,:);assert(~isempty(q),'Cannot sample the interior for sizing.');
+d=inf(size(q,1),1);
+for k=1:size(p,1)-1
+    a=p(k,:);v=p(k+1,:)-a;
+    t=max(0,min(1,((q-a)*v')/sum(v.^2)));
+    d=min(d,vecnorm(q-(a+t.*v),2,2));
+end
+reach=max(d);assert(reach>0,'No positive interior distance found.');
 end

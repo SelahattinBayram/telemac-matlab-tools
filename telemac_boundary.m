@@ -5,6 +5,8 @@ function result=telemac_boundary(slfPath,cliPath,segments)
 % telemac_boundary(slfPath,cliPath,segments) exports without a GUI.
 % Segment fields: Name, NodeIDs, Codes [LIHBOR LIUBOR LIVBOR LITBOR],
 % Values [HBOR UBOR VBOR AUBOR TBOR ATBOR BTBOR].
+% Export order follows the contour, not the order in which segments are selected.
+% Outer contour: counterclockwise, starting at TELEMAC's minimum-X+Y node.
 if nargin==0
     [file,folder]=uigetfile('*.slf','Select an existing TELEMAC SLF file');
     if isequal(file,0), result=[]; return; end
@@ -16,7 +18,7 @@ if nargin<2
     [cliPath,bc2Path,segments]=editBoundaries(nodes,triangles,ipobo,ids,loops,slfPath);
 else
     if nargin<3, segments=[]; end
-    [cliPath,bc2Path]=saveBoundaries(cliPath,nodes,triangles,ipobo,ids,loops,segments,false);
+    [cliPath,bc2Path,segments]=saveBoundaries(cliPath,nodes,triangles,ipobo,ids,loops,segments,false);
 end
 result=struct('GeometryFile',slfPath,'BoundaryFile',cliPath,'BC2File',bc2Path,'Segments',segments);
 if ~isempty(cliPath)
@@ -91,23 +93,9 @@ assert(numel(borderNodes)>=3 && size(border,1)==numel(borderNodes) && ...
     numel(unique(border(:,2)))==numel(borderNodes),'Invalid SLF boundary loops.');
 nextNode=zeros(size(ipobo));
 nextNode(border(:,1))=border(:,2);
-ids=find(ipobo>0);
-[~,order]=sort(ipobo(ids));
-ids=ids(order);
-if isequal(sort(ids),borderNodes) && isequal(ipobo(ids),(1:numel(ids))')
-    next=ipobo(nextNode(ids));
-    ends=find(next~=(2:numel(ids)+1)');
-    starts=[1;ends(1:end-1)+1];
-    if ~isempty(ends) && ends(end)==numel(ids) && ...
-            all(next(ends)==starts) && all(ends-starts>=2)
-        loops=arrayfun(@(a,b) a:b,starts,ends,'UniformOutput',false);
-        rowOfNode=ipobo;
-        return;
-    end
-end
-
-% Some SLFs store global node IDs in IPOBO instead of the boundary row ranks.
-% Derive the oriented contours from the triangles, keeping the same node IDs.
+% Always rebuild the directed contours. Even a consecutive IPOBO sequence
+% can start at a different node and therefore give a misleading CLI order.
+% Global mesh node IDs and the source SLF remain unchanged.
 visited=false(size(ipobo));
 buffer=zeros(size(borderNodes));
 contours={};
@@ -124,7 +112,12 @@ for first=borderNodes.'
     end
     assert(node==first && n>=3,'SLF boundary loop does not close.');
     ring=buffer(1:n);
-    [~,start]=min(sum(xy(ring,:),2));
+    % Match FRONT2's southwest start, including its tolerance/tie rule.
+    sums=sum(xy(ring,:),2);
+    tolerance=(max(sums)-min(sums))*1e-4;
+    candidates=find(sums<=min(sums)+tolerance);
+    [~,south]=min(xy(ring(candidates),2));
+    start=candidates(south);
     ring=ring([start:end 1:start-1]);
     v=xy(ring,:)-xy(ring(1),:);
     w=v([2:end 1],:);
@@ -391,7 +384,7 @@ end
             if ~strcmp(answer,'Replace'), return; end
         end
         try
-            [path,bc2Path]=saveBoundaries(target,nodes,triangles,ipobo,ids,loops,segments,true);
+            [path,bc2Path,segments]=saveBoundaries(target,nodes,triangles,ipobo,ids,loops,segments,true);
             uiresume(fig);
         catch err
             errordlg(err.message,'Boundary file write error','modal');
@@ -449,7 +442,7 @@ for i=1:numel(segments)
 end
 end
 
-function [cliPath,bc2Path]=saveBoundaries(cliPath,nodes,triangles,ipobo,ids,loops,segments,overwrite)
+function [cliPath,bc2Path,segments]=saveBoundaries(cliPath,nodes,triangles,ipobo,ids,loops,segments,overwrite)
 [folder,stem,ext]=fileparts(cliPath);
 assert(strcmpi(ext,'.cli'),'Output file extension must be .cli.');
 if isempty(folder), folder=pwd; end
@@ -459,6 +452,13 @@ paths={cliPath,bc2Path};
 exists=cellfun(@isfile,paths);
 assert(overwrite || ~any(exists),'A CLI or BC2 file with this name already exists.');
 [table,names,sections]=boundaryTable(ids,ipobo,loops,segments);
+% BC2 segment IDs follow their first occurrence in the exported CLI.
+% A segment crossing the contour start is still a single BC2 segment.
+firstRows=cellfun(@(ranges) min(ranges(:)),sections);
+[~,order]=sort(firstRows);
+segments=segments(order);
+sections=sections(order);
+liquidIDs=liquidBoundaryNumbers(table,loops);
 stage=tempname(folder);
 [ok,message]=mkdir(stage);
 assert(ok,'%s',message);
@@ -490,6 +490,42 @@ catch err
         end
     end
     rethrow(err);
+end
+fprintf('Liquid boundary order (CAS list entries):\n');
+for boundary=1:max(liquidIDs)
+    rows=find(liquidIDs==boundary);
+    labels=unique(names(rows),'stable');
+    labels=labels(strlength(labels)>0);
+    fprintf('  %d: %s | first CLI row %d | nodes %d .. %d\n', ...
+        boundary,strjoin(cellstr(labels),', '),rows(1),ids(rows(1)),ids(rows(end)));
+end
+end
+
+function numbers=liquidBoundaryNumbers(table,loops)
+% Hydraulic flags define liquid runs, not segment names or selection order.
+% FRONT2 separates adjacent liquid runs if LIHBOR or LIUBOR changes.
+numbers=zeros(size(table,1),1);
+count=0;
+for k=1:numel(loops)
+    r=loops{k}(:);
+    liquid=table(r,1)~=2;
+    flags=table(r,[1 2]);
+    local=zeros(numel(r),1);
+    n=0;
+    for j=1:numel(r)
+        if ~liquid(j), continue; end
+        if j==1 || ~liquid(j-1) || any(flags(j,:)~=flags(j-1,:))
+            n=n+1;
+        end
+        local(j)=n;
+    end
+    % Merge the last and first runs when the same boundary wraps the start.
+    if n>1 && liquid(1) && liquid(end) && all(flags(1,:)==flags(end,:))
+        local(local==n)=1;
+        n=n-1;
+    end
+    numbers(r(local>0))=count+local(local>0);
+    count=count+n;
 end
 end
 
